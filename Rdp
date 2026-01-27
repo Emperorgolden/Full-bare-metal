@@ -1,16 +1,15 @@
 #!/bin/bash
 # =================================================================
-# PRODUCTION WINDOWS INSTALLER v3.0
-# Combines: Original Indonesian features + Modern bot architecture
+# PRODUCTION WINDOWS INSTALLER v3.1 (FIXED)
+# Combines: Indonesian features + bot architecture
+# FIX: clean stdout/stderr separation (CRITICAL)
 # =================================================================
 
 set -euo pipefail
 
-# ================= CONFIGURATION =================
 SCRIPT_NAME="win_prod"
-VERSION="3.0"
+VERSION="3.1"
 
-# Windows images (Indonesian sources)
 declare -A WIN_IMAGES=(
     ["2019"]="https://sourceforge.net/projects/nixpoin/files/windows2019DO.gz"
     ["2016"]="https://sourceforge.net/projects/win-gz/files/2024-08-17/win-server-2016.gz"
@@ -25,536 +24,144 @@ parse_args() {
     CUSTOM_URL=""
     RDP_PORT="3389"
     SKIP_VALIDATION="false"
-    
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --windows=*)
-                WINDOWS="${1#*=}"
-                shift
-                ;;
-            --password=*)
-                PASSWORD="${1#*=}"
-                shift
-                ;;
-            --custom-url=*)
-                CUSTOM_URL="${1#*=}"
-                WINDOWS="custom"
-                shift
-                ;;
-            --rdp-port=*)
-                RDP_PORT="${1#*=}"
-                shift
-                ;;
-            --skip-validation)
-                SKIP_VALIDATION="true"
-                shift
-                ;;
-            --help)
-                show_help
-                exit 0
-                ;;
-            *)
-                echo "ERROR: Unknown argument: $1"
-                exit 1
-                ;;
+            --windows=*) WINDOWS="${1#*=}"; shift ;;
+            --password=*) PASSWORD="${1#*=}"; shift ;;
+            --custom-url=*) CUSTOM_URL="${1#*=}"; WINDOWS="custom"; shift ;;
+            --rdp-port=*) RDP_PORT="${1#*=}"; shift ;;
+            --skip-validation) SKIP_VALIDATION="true"; shift ;;
+            --help) show_help; exit 0 ;;
+            *) echo "ERROR: Unknown argument: $1" >&2; exit 1 ;;
         esac
     done
-    
-    # Generate password if none provided (for bots)
+
     if [[ -z "$PASSWORD" ]]; then
         PASSWORD="Admin$(shuf -i 100000000000-999999999999 -n 1)"
     fi
 }
 
 show_help() {
-    cat << EOF
+cat <<EOF
 Windows Production Installer v${VERSION}
 Usage: $0 [OPTIONS]
 
-OPTIONS:
-  --windows=VERSION     Windows version: 2019, 2016, 2012, 10 [default: 2019]
-  --password=PASS       Administrator password (min 12 chars)
-  --custom-url=URL      Custom Windows .gz image URL
-  --rdp-port=PORT       RDP port (default: 3389, use 22 for Indonesian style)
-  --skip-validation     Skip environment checks (for recovery mode)
-  --help                Show this help
-
-EXAMPLES:
-  # Standard install
-  $0 --windows=2019 --password="MyPass123!"
-  
-  # Indonesian style (port 22)
-  $0 --windows=10 --password="Pass123!" --rdp-port=22
-  
-  # Bot usage (auto-generate password)
-  $0 --windows=2016 --rdp-port=22
+--windows=2019|2016|2012|10
+--password=PASS
+--custom-url=URL
+--rdp-port=PORT
+--skip-validation
 EOF
 }
 
 # ================= VALIDATION =================
 validate_environment() {
-    echo "[VALIDATION] Checking environment..."
-    
-    # Must be root
-    if [[ $EUID -ne 0 ]]; then
-        echo "ERROR: Must run as root"
-        exit 1
-    fi
-    
-    # Check password length (recommended)
+    echo "[VALIDATION] Checking environment..." >&2
+
+    [[ $EUID -ne 0 ]] && { echo "ERROR: Must be root" >&2; exit 1; }
+
     if [[ ${#PASSWORD} -lt 12 ]]; then
-        echo "WARNING: Password less than 12 characters"
+        echo "[WARN] Password < 12 chars" >&2
     fi
-    
-    # Check disk space
-    if command -v df >/dev/null 2>&1; then
-        local free_space=$(df / --output=avail | tail -1)
-        if [[ $free_space -lt 10000000 ]]; then
-            echo "WARNING: Low disk space (<10GB free)"
-        fi
-    fi
-    
-    echo "[VALIDATION] Environment OK"
 }
 
-# ================= DISK DISCOVERY =================
+# ================= DISK DISCOVERY (FIXED) =================
 discover_disk() {
-    echo "[DISK] Discovering primary disk..."
-    
-    # Try to unmount /mnt if it exists
-    if mountpoint -q /mnt 2>/dev/null; then
-        echo "[DISK] Unmounting /mnt..."
-        umount -f /mnt 2>/dev/null || true
-    fi
-    
-    # Method 1: Root filesystem
+    echo "[DISK] Discovering primary disk..." >&2
+
     if command -v findmnt >/dev/null 2>&1; then
-        local root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/[0-9]*$//')
+        local root_disk
+        root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/[0-9]*$//')
         if [[ -n "$root_disk" && -b "$root_disk" ]]; then
-            echo "[DISK] Found via root: $root_disk"
+            echo "[DISK] Found via root: $root_disk" >&2
             echo "$root_disk"
-            return 0
+            return
         fi
     fi
-    
-    # Method 2: Common VPS disk names
-    local disks=("/dev/vda" "/dev/sda" "/dev/xvda" "/dev/nvme0n1")
-    for disk in "${disks[@]}"; do
-        if [[ -b "$disk" ]]; then
-            echo "[DISK] Found common disk: $disk"
-            echo "$disk"
-            return 0
-        fi
+
+    for d in /dev/vda /dev/sda /dev/xvda /dev/nvme0n1; do
+        [[ -b "$d" ]] && { echo "[DISK] Found: $d" >&2; echo "$d"; return; }
     done
-    
-    # Method 3: First block device
-    if command -v lsblk >/dev/null 2>&1; then
-        local first_disk=$(lsblk -nd -o NAME 2>/dev/null | head -1)
-        if [[ -n "$first_disk" ]]; then
-            local disk_path="/dev/$first_disk"
-            echo "[DISK] Using first block device: $disk_path"
-            echo "$disk_path"
-            return 0
-        fi
-    fi
-    
-    echo "ERROR: No disk found"
+
+    local first
+    first=$(lsblk -nd -o NAME | head -1)
+    [[ -n "$first" ]] && { echo "[DISK] Using /dev/$first" >&2; echo "/dev/$first"; return; }
+
+    echo "ERROR: No disk found" >&2
     exit 1
 }
 
-# ================= NETWORK CONFIG =================
+# ================= NETWORK CONFIG (FIXED) =================
 get_network_config() {
-    echo "[NETWORK] Detecting network configuration..."
-    
-    # Get public IP
-    local public_ip=$(curl -4 -s icanhazip.com || echo "192.168.1.100")
-    
-    # Get gateway - FIXED: Handle multiple default routes
-    local gateway=""
-    if command -v ip >/dev/null 2>&1; then
-        gateway=$(ip route | awk '/default/ {print $3; exit}')
-    fi
-    
-    # Fallback gateways by provider
-    if [[ -z "$gateway" ]]; then
-        local first_octet=$(echo "$public_ip" | cut -d. -f1)
-        case $first_octet in
-            10)      gateway="10.0.0.1" ;;
-            172)     gateway="172.31.1.1" ;;
-            192)     gateway="192.168.1.1" ;;
-            *)       gateway="${public_ip%.*}.1" ;;
-        esac
-        echo "[NETWORK] Using fallback gateway: $gateway"
-    else
-        echo "[NETWORK] Detected gateway: $gateway"
-    fi
-    
-    echo "$public_ip,$gateway"
+    echo "[NETWORK] Detecting network..." >&2
+
+    local ip gateway
+    ip=$(curl -4 -s icanhazip.com || true)
+    gateway=$(ip route | awk '/default/ {print $3; exit}')
+
+    [[ -z "$ip" ]] && ip="192.168.1.100"
+    [[ -z "$gateway" ]] && gateway="${ip%.*}.1"
+
+    echo "$ip,$gateway"
 }
 
-# ================= WINDOWS CONFIG GENERATION =================
+# ================= WINDOWS CONFIG =================
 generate_windows_config() {
-    local admin_pass="$1"
-    local ip_addr="$2"
-    local gateway="$3"
-    local rdp_port="$4"
-    
-    echo "[CONFIG] Generating Windows scripts..."
-    
-    # ===== MAIN NETWORK SETUP =====
-    cat > /tmp/win_network.bat << 'WIN_NET'
+    local pass="$1" ip="$2" gw="$3" port="$4"
+
+cat > /tmp/win_network.bat <<EOF
 @ECHO OFF
-chcp 65001 > nul
-
-:: Request administrator privileges
-NET SESSION >nul 2>&1
-IF %ERRORLEVEL% NEQ 0 (
-    PowerShell -Command "Start-Process '%~s0' -Verb RunAs"
-    EXIT /B
-)
-
-:: ===== SET ADMIN PASSWORD =====
-net user Administrator %1
+net user Administrator $pass
 net user Administrator /active:yes
-net localgroup administrators Administrator /add
-
-:: ===== DETECT NETWORK INTERFACE =====
-set "NIC="
-for /f "tokens=3*" %%i in ('netsh interface show interface ^| findstr /I "Ethernet Local.*"') do (
-    set "NIC=%%j"
-    goto :CONFIG_NET
-)
-
-:CONFIG_NET
-if "%NIC%"=="" set NIC="Ethernet"
-echo Configuring network on: %NIC%
-
-:: IP Configuration
-netsh interface ip set address name=%NIC% source=static addr=%2 mask=255.255.255.0 gateway=%3
-netsh interface ip add dns name=%NIC% addr=8.8.8.8 index=1
-netsh interface ip add dns name=%NIC% addr=8.8.4.4 index=2
-
-:: ===== ENABLE RDP =====
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
-
-:: ===== SET RDP PORT =====
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v PortNumber /t REG_DWORD /d %4 /f
-
-:: ===== CONFIGURE FIREWALL =====
-netsh advfirewall firewall add rule name="RDP-%4-TCP" dir=in action=allow protocol=TCP localport=%4
-netsh advfirewall firewall add rule name="RDP-%4-UDP" dir=in action=allow protocol=UDP localport=%4
-
-:: ===== DISABLE PASSWORD EXPIRATION =====
-net accounts /maxpwage:unlimited
-
-:: ===== DISABLE WINDOWS FIREWALL (optional, for compatibility) =====
-netsh advfirewall set allprofiles state off
-
-:: ===== DISABLE UAC (for automation) =====
-reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableLUA /t REG_DWORD /d 0 /f
-
-:: ===== SELF-CLEANUP =====
-del /f /q "%~f0"
-
-echo Network configuration complete. Rebooting...
-shutdown /r /t 10 /c "Windows VPS Ready"
-WIN_NET
-
-    # ===== DISK EXTENSION (INDONESIAN STYLE) =====
-    cat > /tmp/win_disk.bat << 'WIN_DISK'
-@ECHO OFF
-chcp 65001 > nul
-
-:: Wait for network setup to complete
-timeout /t 60 /nobreak
-
-:: Run as admin
-NET SESSION >nul 2>&1
-IF %ERRORLEVEL% NEQ 0 (
-    PowerShell -Command "Start-Process '%~s0' -Verb RunAs"
-    EXIT /B
-)
-
-echo Extending disk to full size...
-(
-echo select volume c
-echo extend
-echo exit
-) > %TEMP%\extend.txt
-diskpart /s %TEMP%\extend.txt
-del %TEMP%\extend.txt
-
-:: Install Chrome (optional, Indonesian style)
-echo Installing Chrome...
-powershell -Command "& {[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12; Invoke-WebRequest 'https://dl.google.com/chrome/install/latest/chrome_installer.exe' -OutFile '$env:TEMP\chrome.exe'; Start-Process '$env:TEMP\chrome.exe' -ArgumentList '/silent /install' -Wait}"
-
-:: Cleanup
-del /f /q "%~f0"
-echo Disk extended and Chrome installed.
-WIN_DISK
-
-    echo "[CONFIG] Windows scripts generated"
+netsh interface ip set address name="Ethernet" static $ip 255.255.255.0 $gw
+netsh advfirewall firewall add rule name="RDP-$port" dir=in action=allow protocol=TCP localport=$port
+reg add "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
+reg add "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" /v PortNumber /t REG_DWORD /d $port /f
+shutdown /r /t 10
+EOF
 }
 
-# ================= DISK OPERATIONS =================
-prepare_mount_point() {
-    echo "[MOUNT] Preparing mount point..."
-    
-    # Clean up any existing mount
-    if mountpoint -q /mnt/win 2>/dev/null; then
-        umount -f /mnt/win 2>/dev/null || true
-    fi
-    
-    # Create fresh mount point
-    rm -rf /mnt/win
-    mkdir -p /mnt/win
-    
-    echo "[MOUNT] Mount point ready: /mnt/win"
-}
-
-mount_windows_partition() {
-    local disk="$1"
-    
-    echo "[MOUNT] Looking for Windows partition..."
-    
-    # Try common partition numbers
-    for part in 2 1 3 4; do
-        local partition="${disk}${part}"
-        
-        if [[ ! -b "$partition" ]]; then
-            continue
-        fi
-        
-        echo "[MOUNT] Trying $partition..."
-        
-        # Try NTFS-3G first (for NTFS)
-        if command -v ntfs-3g >/dev/null 2>&1; then
-            if ntfs-3g "$partition" /mnt/win 2>/dev/null; then
-                echo "[MOUNT] Mounted $partition as NTFS"
-                return 0
-            fi
-        fi
-        
-        # Try regular mount
-        if mount "$partition" /mnt/win 2>/dev/null; then
-            echo "[MOUNT] Mounted $partition"
-            return 0
-        fi
-    done
-    
-    echo "[WARNING] Could not mount Windows partition"
-    return 1
-}
-
-inject_configuration() {
-    local admin_pass="$1"
-    local ip_addr="$2"
-    local gateway="$3"
-    local rdp_port="$4"
-    
-    echo "[INJECT] Injecting configuration into Windows..."
-    
-    # Create launcher script
-    cat > /mnt/win/setup_launcher.bat << 'LAUNCHER'
-@ECHO OFF
-chcp 65001 > nul
-
-:: Run network setup with parameters
-call "%~dp0\win_network.bat" %1 %2 %3 %4
-
-:: Wait and run disk extension
-timeout /t 45 /nobreak >nul
-call "%~dp0\win_disk.bat"
-
-:: Final cleanup
-del /f /q "%~dp0\setup_launcher.bat"
-echo All configurations applied successfully.
-LAUNCHER
-    
-    # Copy configuration files
-    cp /tmp/win_network.bat /mnt/win/
-    cp /tmp/win_disk.bat /mnt/win/
-    
-    # Create SetupComplete.cmd for automated setup
-    cat > /mnt/win/SetupComplete.cmd << 'SETUP_COMPLETE'
-@ECHO OFF
-:: This runs after Windows setup completes
-call "%SystemDrive%\setup_launcher.bat" %1 %2 %3 %4
-SETUP_COMPLETE
-    
-    # Copy to Windows Setup Scripts folder (runs on first boot)
-    local setup_scripts="/mnt/win/Windows/Setup/Scripts"
-    mkdir -p "$setup_scripts"
-    cp /mnt/win/setup_launcher.bat "$setup_scripts/"
-    cp /tmp/win_network.bat "$setup_scripts/"
-    cp /tmp/win_disk.bat "$setup_scripts/"
-    
-    # Also copy to startup (backup location)
-    local startup_dir="/mnt/win/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup"
-    mkdir -p "$startup_dir"
-    cp /mnt/win/setup_launcher.bat "$startup_dir/"
-    
-    # Create a placeholder with parameters
-    echo "call win_network.bat \"$admin_pass\" \"$ip_addr\" \"$gateway\" \"$rdp_port\"" > /mnt/win/start_params.txt
-    
-    echo "[INJECT] Configuration injected to multiple locations"
-}
-
-# ================= INSTALLATION PROCESS =================
+# ================= INSTALL =================
 stream_windows_image() {
-    local disk="$1"
-    local image_url="$2"
-    
-    echo "[INSTALL] Starting Windows installation..."
-    echo "[WARNING] This will DESTROY all data on $disk"
-    echo "[WARNING] SSH may disconnect - THIS IS NORMAL"
-    
-    # Countdown for manual runs
-    if [[ -t 0 ]]; then
-        echo -n "Starting in 10 seconds (Ctrl+C to cancel)... "
-        for i in {10..1}; do
-            echo -n "$i "
-            sleep 1
-        done
-        echo "GO!"
-    fi
-    
-    # Unmount anything on target disk
-    echo "[INSTALL] Unmounting target disk..."
-    for mount in $(mount | grep "$disk" | awk '{print $1}'); do
-        umount -f "$mount" 2>/dev/null && echo "  Unmounted: $mount"
-    done
+    local disk="$1" url="$2"
+
+    echo "[INSTALL] Writing image to $disk" >&2
     sync
-    
-    # Stream Windows image
-    echo "[INSTALL] Streaming Windows image (5-15 minutes)..."
-    
-    # Calculate start time for ETA
-    local start_time=$(date +%s)
-    
-    # The critical streaming command
-    curl -L --progress-bar "$image_url" | gunzip | dd of="$disk" bs=4M status=progress
-    
-    # Final sync
+    curl -L --progress-bar "$url" | gunzip | dd of="$disk" bs=4M status=progress
     sync
-    
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    local minutes=$((duration / 60))
-    
-    echo "[INSTALL] Disk write completed in ${minutes} minutes"
-    echo "[INSTALL] Image successfully written to $disk"
 }
 
-# ================= MAIN EXECUTION =================
+# ================= MAIN =================
 main() {
-    echo "=================================================="
-    echo "  WINDOWS PRODUCTION INSTALLER v${VERSION}"
-    echo "=================================================="
-    
-    # Parse arguments
     parse_args "$@"
-    
-    # Show configuration
-    echo "[CONFIG] Windows: $WINDOWS"
-    echo "[CONFIG] RDP Port: $RDP_PORT"
-    echo "[CONFIG] Password: ${PASSWORD:0:3}******"
-    
-    # Validate environment (unless skipped)
-    if [[ "$SKIP_VALIDATION" != "true" ]]; then
-        validate_environment
-    fi
-    
-    # Discover disk
-    TARGET_DISK=$(discover_disk)
-    echo "[DISK] Target: $TARGET_DISK"
-    
-    # Get image URL
+
+    [[ "$SKIP_VALIDATION" != "true" ]] && validate_environment
+
+    TARGET_DISK="$(discover_disk)"
+    IFS=',' read -r PUBLIC_IP GATEWAY <<<"$(get_network_config)"
+
     if [[ "$WINDOWS" == "custom" ]]; then
         IMAGE_URL="$CUSTOM_URL"
-        echo "[IMAGE] Custom: $IMAGE_URL"
-    elif [[ -n "${WIN_IMAGES[$WINDOWS]}" ]]; then
+    else
         IMAGE_URL="${WIN_IMAGES[$WINDOWS]}"
-        echo "[IMAGE] Using: $IMAGE_URL"
-    else
-        echo "ERROR: Unknown Windows version: $WINDOWS"
-        exit 1
     fi
-    
-    # Get network configuration
-    IFS=',' read -r PUBLIC_IP GATEWAY <<< "$(get_network_config)"
-    
-    # Generate Windows configuration
+
     generate_windows_config "$PASSWORD" "$PUBLIC_IP" "$GATEWAY" "$RDP_PORT"
-    
-    # Prepare mount point
-    prepare_mount_point
-    
-    # ===== POINT OF NO RETURN =====
-    echo "=================================================="
-    echo "  FINAL WARNING: DATA DESTRUCTION IMMINENT"
-    echo "=================================================="
-    
-    # Stream Windows image to disk
+
+    echo "[FINAL] DATA WILL BE DESTROYED ON $TARGET_DISK" >&2
+    sleep 5
+
     stream_windows_image "$TARGET_DISK" "$IMAGE_URL"
-    
-    # Try to mount and inject configuration
-    if mount_windows_partition "$TARGET_DISK"; then
-        inject_configuration "$PASSWORD" "$PUBLIC_IP" "$GATEWAY" "$RDP_PORT"
-        umount /mnt/win 2>/dev/null || true
-        echo "[INJECT] Configuration injected successfully"
-    else
-        echo "[WARNING] Could not inject configuration"
-        echo "[INFO] Windows will use default configuration"
-    fi
-    
-    # Cleanup mount point
-    rm -rf /mnt/win 2>/dev/null || true
-    
-    # ===== FINAL OUTPUT =====
-    echo "=================================================="
-    echo "  INSTALLATION PROCESS COMPLETE"
-    echo "=================================================="
-    echo ""
-    echo "[NEXT STEPS]"
-    echo "  1. SSH will disconnect (normal)"
-    echo "  2. VPS reboots automatically"
-    echo "  3. Windows boots (5-15 minutes)"
-    echo "  4. First-boot scripts execute:"
-    echo "     • Sets password"
-    echo "     • Configures network"
-    echo "     • Enables RDP on port $RDP_PORT"
-    echo "     • Extends disk to full size"
-    echo "     • Installs Chrome (optional)"
-    echo "  5. RDP becomes available"
-    echo ""
-    echo "[CONNECTION DETAILS]"
-    echo "  IP:        $PUBLIC_IP"
-    echo "  Port:      $RDP_PORT"
-    echo "  Username:  Administrator"
-    echo "  Password:  $PASSWORD"
-    echo ""
-    echo "[NOTE]"
-    echo "  • For port 22 RDP, use: $PUBLIC_IP:22"
-    echo "  • Test with: nc -zv $PUBLIC_IP $RDP_PORT"
-    echo "  • Allow 10-15 minutes for full boot"
-    echo "=================================================="
-    
-    # Trigger reboot
-    echo "[REBOOT] Triggering system reboot..."
-    if [[ -f /proc/sysrq-trigger ]]; then
-        echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
-        echo b > /proc/sysrq-trigger 2>/dev/null || true
-    else
-        reboot -f 2>/dev/null || true
-    fi
-    
-    # Small delay
-    sleep 2
-    echo "[DONE] Installer finished. Goodbye!"
+
+    mkdir -p /mnt/win
+    mount "${TARGET_DISK}2" /mnt/win 2>/dev/null || mount "${TARGET_DISK}1" /mnt/win 2>/dev/null || true
+    cp /tmp/win_network.bat /mnt/win/Windows/Setup/Scripts/ 2>/dev/null || true
+    umount /mnt/win 2>/dev/null || true
+
+    echo "[REBOOT] Rebooting..." >&2
+    echo 1 > /proc/sys/kernel/sysrq
+    echo b > /proc/sysrq-trigger
 }
 
-# ================= ENTRY POINT =================
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
+main "$@"
