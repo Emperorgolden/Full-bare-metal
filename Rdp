@@ -1,167 +1,112 @@
 #!/bin/bash
-# =================================================================
-# PRODUCTION WINDOWS INSTALLER v3.1 (FIXED)
-# Combines: Indonesian features + bot architecture
-# FIX: clean stdout/stderr separation (CRITICAL)
-# =================================================================
 
-set -euo pipefail
+echo "Select the Windows OS you want to install"
+echo "  1) Windows Server 2019 (Default)"
+echo "  2) Windows 10 Super Lite (SourceForge)"
+echo "  3) Windows 10 Super Lite (MediaFire)"
+echo "  4) Windows 10 Super Lite (Custom Fast Mirror)"
+echo "  5) Use your own .gz image link"
 
-SCRIPT_NAME="win_prod"
-VERSION="3.1"
+read -p "Select [1]: " SELECT_OS
 
-declare -A WIN_IMAGES=(
-    ["2019"]="https://sourceforge.net/projects/nixpoin/files/windows2019DO.gz"
-    ["2016"]="https://sourceforge.net/projects/win-gz/files/2024-08-17/win-server-2016.gz"
-    ["2012"]="https://sourceforge.net/projects/nixpoin/files/windows2012DO.gz"
-    ["10"]="https://umbel.my.id/wedus10lite.gz"
+case "$SELECT_OS" in
+    1|"") IMAGE_URL="https://sourceforge.net/projects/nixpoin/files/windows2019DO.gz" ;;
+    2) IMAGE_URL="https://master.dl.sourceforge.net/project/manyod/wedus10lite.gz?viasf=1" ;;
+    3) IMAGE_URL="https://download1582.mediafire.com/lemxvneeredgyBT5P6YtAU5Dq-mikaH29djd8VnlyMcV1iM_vHJzYCiTc8V3PQkUslqgQSG0ftRJ0X2w3t1D7T4a-616-phGqQ2xKCn8894r0fdV9jKMhVYKH8N1dXMvtsZdK6e4t9F4Hg66wCzpXvuD_jcRu9_-i65_Kbr-HeW8Bw/gcxlheshfpbyigg/wedus10lite.gz" ;;
+    4) IMAGE_URL="https://umbel.my.id/wedus10lite.gz" ;;
+    5) read -p "Enter your custom .gz image URL: " IMAGE_URL ;;
+    *) echo "Invalid selection"; exit 1 ;;
+esac
+
+echo
+echo "WARNING: Weak passwords are easily brute-forced."
+read -p "Enter Administrator password (minimum 12 characters): " ADMIN_PASS
+
+PUBLIC_IP=$(curl -4 -s icanhazip.com)
+GATEWAY=$(ip route | awk '/default/ { print $3 }')
+
+# ================= Windows Network Script =================
+cat > /tmp/network_setup.bat <<EOF
+@ECHO OFF
+:: Request Administrator privileges
+cd.>%windir%\GetAdmin
+if exist %windir%\GetAdmin (del /f /q "%windir%\GetAdmin") else (
+  echo CreateObject^("Shell.Application"^).ShellExecute "%~s0", "%*", "", "runas", 1 >> "%temp%\Admin.vbs"
+  "%temp%\Admin.vbs"
+  del /f /q "%temp%\Admin.vbs"
+  exit /b 2
 )
 
-# ================= ARGUMENT PARSING =================
-parse_args() {
-    WINDOWS="2019"
-    PASSWORD=""
-    CUSTOM_URL=""
-    RDP_PORT="3389"
-    SKIP_VALIDATION="false"
+:: Set Administrator password
+net user Administrator $ADMIN_PASS
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --windows=*) WINDOWS="${1#*=}"; shift ;;
-            --password=*) PASSWORD="${1#*=}"; shift ;;
-            --custom-url=*) CUSTOM_URL="${1#*=}"; WINDOWS="custom"; shift ;;
-            --rdp-port=*) RDP_PORT="${1#*=}"; shift ;;
-            --skip-validation) SKIP_VALIDATION="true"; shift ;;
-            --help) show_help; exit 0 ;;
-            *) echo "ERROR: Unknown argument: $1" >&2; exit 1 ;;
-        esac
-    done
+:: Configure network
+netsh interface ip set address name="Ethernet Instance 0" source=static address=$PUBLIC_IP mask=255.255.240.0 gateway=$GATEWAY
+netsh interface ip add dnsservers name="Ethernet Instance 0" address=8.8.8.8 index=1 validate=no
+netsh interface ip add dnsservers name="Ethernet Instance 0" address=8.8.4.4 index=2 validate=no
 
-    if [[ -z "$PASSWORD" ]]; then
-        PASSWORD="Admin$(shuf -i 100000000000-999999999999 -n 1)"
-    fi
-}
-
-show_help() {
-cat <<EOF
-Windows Production Installer v${VERSION}
-Usage: $0 [OPTIONS]
-
---windows=2019|2016|2012|10
---password=PASS
---custom-url=URL
---rdp-port=PORT
---skip-validation
+:: Cleanup
+cd /d "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
+del /f /q network_setup.bat
+exit
 EOF
-}
 
-# ================= VALIDATION =================
-validate_environment() {
-    echo "[VALIDATION] Checking environment..." >&2
-
-    [[ $EUID -ne 0 ]] && { echo "ERROR: Must be root" >&2; exit 1; }
-
-    if [[ ${#PASSWORD} -lt 12 ]]; then
-        echo "[WARN] Password < 12 chars" >&2
-    fi
-}
-
-# ================= DISK DISCOVERY (FIXED) =================
-discover_disk() {
-    echo "[DISK] Discovering primary disk..." >&2
-
-    if command -v findmnt >/dev/null 2>&1; then
-        local root_disk
-        root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/[0-9]*$//')
-        if [[ -n "$root_disk" && -b "$root_disk" ]]; then
-            echo "[DISK] Found via root: $root_disk" >&2
-            echo "$root_disk"
-            return
-        fi
-    fi
-
-    for d in /dev/vda /dev/sda /dev/xvda /dev/nvme0n1; do
-        [[ -b "$d" ]] && { echo "[DISK] Found: $d" >&2; echo "$d"; return; }
-    done
-
-    local first
-    first=$(lsblk -nd -o NAME | head -1)
-    [[ -n "$first" ]] && { echo "[DISK] Using /dev/$first" >&2; echo "/dev/$first"; return; }
-
-    echo "ERROR: No disk found" >&2
-    exit 1
-}
-
-# ================= NETWORK CONFIG (FIXED) =================
-get_network_config() {
-    echo "[NETWORK] Detecting network..." >&2
-
-    local ip gateway
-    ip=$(curl -4 -s icanhazip.com || true)
-    gateway=$(ip route | awk '/default/ {print $3; exit}')
-
-    [[ -z "$ip" ]] && ip="192.168.1.100"
-    [[ -z "$gateway" ]] && gateway="${ip%.*}.1"
-
-    echo "$ip,$gateway"
-}
-
-# ================= WINDOWS CONFIG =================
-generate_windows_config() {
-    local pass="$1" ip="$2" gw="$3" port="$4"
-
-cat > /tmp/win_network.bat <<EOF
+# ================= Disk + RDP Script =================
+cat > /tmp/rdp_disk_setup.bat <<EOF
 @ECHO OFF
-net user Administrator $pass
-net user Administrator /active:yes
-netsh interface ip set address name="Ethernet" static $ip 255.255.255.0 $gw
-netsh advfirewall firewall add rule name="RDP-$port" dir=in action=allow protocol=TCP localport=$port
-reg add "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
-reg add "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" /v PortNumber /t REG_DWORD /d $port /f
-shutdown /r /t 10
+echo DO NOT CLOSE THIS WINDOW
+echo THIS SCRIPT WILL CHANGE RDP PORT TO 22
+echo AFTER RESTART CONNECT USING: $PUBLIC_IP:22
+echo TYPE YES AND PRESS ENTER IF ASKED
+
+:: Request Administrator privileges
+cd.>%windir%\GetAdmin
+if exist %windir%\GetAdmin (del /f /q "%windir%\GetAdmin") else (
+  echo CreateObject^("Shell.Application"^).ShellExecute "%~s0", "%*", "", "runas", 1 >> "%temp%\Admin.vbs"
+  "%temp%\Admin.vbs"
+  del /f /q "%temp%\Admin.vbs"
+  exit /b 2
+)
+
+:: Open RDP port 22
+set PORT=22
+set RULE_NAME="Open Port %PORT%"
+
+netsh advfirewall firewall show rule name=%RULE_NAME% >nul
+if ERRORLEVEL 1 (
+  netsh advfirewall firewall add rule name=%RULE_NAME% dir=in action=allow protocol=TCP localport=%PORT%
+)
+
+reg add "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" /v PortNumber /t REG_DWORD /d 22 /f
+
+:: Extend disk
+ECHO SELECT VOLUME=%%SystemDrive%% > "%SystemDrive%\\extend.txt"
+ECHO EXTEND >> "%SystemDrive%\\extend.txt"
+START /WAIT DISKPART /S "%SystemDrive%\\extend.txt"
+del /f /q "%SystemDrive%\\extend.txt"
+
+:: Cleanup
+cd /d "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
+del /f /q rdp_disk_setup.bat
+timeout 50 >nul
+exit
 EOF
-}
 
-# ================= INSTALL =================
-stream_windows_image() {
-    local disk="$1" url="$2"
+# ================= Write Windows Image =================
+echo
+echo "Installing Windows image..."
+echo "ALL DATA ON /dev/vda WILL BE DESTROYED"
+sleep 3
 
-    echo "[INSTALL] Writing image to $disk" >&2
-    sync
-    curl -L --progress-bar "$url" | gunzip | dd of="$disk" bs=4M status=progress
-    sync
-}
+wget --no-check-certificate -O- "$IMAGE_URL" | gunzip | dd of=/dev/vda bs=3M status=progress
 
-# ================= MAIN =================
-main() {
-    parse_args "$@"
+# ================= Inject Startup Scripts =================
+mount.ntfs-3g /dev/vda2 /mnt
+cd "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/"
+cd Start* || cd start*
+cp -f /tmp/network_setup.bat network_setup.bat
+cp -f /tmp/rdp_disk_setup.bat rdp_disk_setup.bat
 
-    [[ "$SKIP_VALIDATION" != "true" ]] && validate_environment
-
-    TARGET_DISK="$(discover_disk)"
-    IFS=',' read -r PUBLIC_IP GATEWAY <<<"$(get_network_config)"
-
-    if [[ "$WINDOWS" == "custom" ]]; then
-        IMAGE_URL="$CUSTOM_URL"
-    else
-        IMAGE_URL="${WIN_IMAGES[$WINDOWS]}"
-    fi
-
-    generate_windows_config "$PASSWORD" "$PUBLIC_IP" "$GATEWAY" "$RDP_PORT"
-
-    echo "[FINAL] DATA WILL BE DESTROYED ON $TARGET_DISK" >&2
-    sleep 5
-
-    stream_windows_image "$TARGET_DISK" "$IMAGE_URL"
-
-    mkdir -p /mnt/win
-    mount "${TARGET_DISK}2" /mnt/win 2>/dev/null || mount "${TARGET_DISK}1" /mnt/win 2>/dev/null || true
-    cp /tmp/win_network.bat /mnt/win/Windows/Setup/Scripts/ 2>/dev/null || true
-    umount /mnt/win 2>/dev/null || true
-
-    echo "[REBOOT] Rebooting..." >&2
-    echo 1 > /proc/sys/kernel/sysrq
-    echo b > /proc/sysrq-trigger
-}
-
-main "$@"
+echo "System will power off in 3 seconds..."
+sleep 3
+poweroff
