@@ -1,112 +1,74 @@
 #!/bin/bash
+set -e
 
-echo "Select the Windows OS you want to install"
-echo "  1) Windows Server 2019 (Default)"
-echo "  2) Windows 10 Super Lite (SourceForge)"
-echo "  3) Windows 10 Super Lite (MediaFire)"
-echo "  4) Windows 10 Super Lite (Custom Fast Mirror)"
+echo "Select Windows image to deploy"
+echo "  1) Windows 2019 (Default)"
+echo "  2) Windows 10 Super Lite SF"
+echo "  3) Windows 10 Super Lite MF"
+echo "  4) Windows 10 Super Lite CF"
 echo "  5) Use your own .gz image link"
 
-read -p "Select [1]: " SELECT_OS
+read -p "Choose [1]: " PILIHOS
 
-case "$SELECT_OS" in
-    1|"") IMAGE_URL="https://sourceforge.net/projects/nixpoin/files/windows2019DO.gz" ;;
-    2) IMAGE_URL="https://master.dl.sourceforge.net/project/manyod/wedus10lite.gz?viasf=1" ;;
-    3) IMAGE_URL="https://download1582.mediafire.com/lemxvneeredgyBT5P6YtAU5Dq-mikaH29djd8VnlyMcV1iM_vHJzYCiTc8V3PQkUslqgQSG0ftRJ0X2w3t1D7T4a-616-phGqQ2xKCn8894r0fdV9jKMhVYKH8N1dXMvtsZdK6e4t9F4Hg66wCzpXvuD_jcRu9_-i65_Kbr-HeW8Bw/gcxlheshfpbyigg/wedus10lite.gz" ;;
-    4) IMAGE_URL="https://umbel.my.id/wedus10lite.gz" ;;
-    5) read -p "Enter your custom .gz image URL: " IMAGE_URL ;;
-    *) echo "Invalid selection"; exit 1 ;;
+case "$PILIHOS" in
+    1|"") PILIHOS="https://sourceforge.net/projects/nixpoin/files/windows2019DO.gz";;
+    2) PILIHOS="https://master.dl.sourceforge.net/project/manyod/wedus10lite.gz?viasf=1";;
+    3) PILIHOS="https://download1582.mediafire.com/lemxvneeredgyBT5P6YtAU5Dq-mikaH29djd8VnlyMcV1iM_vHJzYCiTc8V3PQkUslqgQSG0ftRJ0X2w3t1D7T4a-616-phGqQ2xKCn8894r0fdV9jKMhVYKH8N1dXMvtsZdK6e4t9F4Hg66wCzpXvuD_jcRu9_-i65_Kbr-HeW8Bw/gcxlheshfpbyigg/wedus10lite.gz";;
+    4) PILIHOS="https://umbel.my.id/wedus10lite.gz";;
+    5) read -p "Enter your .gz image URL: " PILIHOS;;
+    *) echo "Invalid selection"; exit 1;;
 esac
 
+echo "Enter Administrator password for Windows (minimum 12 characters)"
+read -s PASSADMIN
 echo
-echo "WARNING: Weak passwords are easily brute-forced."
-read -p "Enter Administrator password (minimum 12 characters): " ADMIN_PASS
 
-PUBLIC_IP=$(curl -4 -s icanhazip.com)
-GATEWAY=$(ip route | awk '/default/ { print $3 }')
+IP4=$(curl -4 -s icanhazip.com)
+GW=$(ip route | awk '/default/ { print $3 }')
 
-# ================= Windows Network Script =================
-cat > /tmp/network_setup.bat <<EOF
+cat >/tmp/net.bat<<EOF
 @ECHO OFF
-:: Request Administrator privileges
-cd.>%windir%\GetAdmin
-if exist %windir%\GetAdmin (del /f /q "%windir%\GetAdmin") else (
-  echo CreateObject^("Shell.Application"^).ShellExecute "%~s0", "%*", "", "runas", 1 >> "%temp%\Admin.vbs"
-  "%temp%\Admin.vbs"
-  del /f /q "%temp%\Admin.vbs"
-  exit /b 2
-)
-
-:: Set Administrator password
-net user Administrator $ADMIN_PASS
-
-:: Configure network
-netsh interface ip set address name="Ethernet Instance 0" source=static address=$PUBLIC_IP mask=255.255.240.0 gateway=$GATEWAY
-netsh interface ip add dnsservers name="Ethernet Instance 0" address=8.8.8.8 index=1 validate=no
-netsh interface ip add dnsservers name="Ethernet Instance 0" address=8.8.4.4 index=2 validate=no
-
-:: Cleanup
-cd /d "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
-del /f /q network_setup.bat
-exit
+net user Administrator $PASSADMIN
+netsh interface ip set address name="Ethernet Instance 0" static $IP4 255.255.240.0 $GW
+netsh interface ip add dnsservers name="Ethernet Instance 0" 8.8.8.8 index=1
+netsh interface ip add dnsservers name="Ethernet Instance 0" 8.8.4.4 index=2
+del /f /q "%~f0"
 EOF
 
-# ================= Disk + RDP Script =================
-cat > /tmp/rdp_disk_setup.bat <<EOF
+cat >/tmp/dpart.bat<<EOF
 @ECHO OFF
-echo DO NOT CLOSE THIS WINDOW
-echo THIS SCRIPT WILL CHANGE RDP PORT TO 22
-echo AFTER RESTART CONNECT USING: $PUBLIC_IP:22
-echo TYPE YES AND PRESS ENTER IF ASKED
-
-:: Request Administrator privileges
-cd.>%windir%\GetAdmin
-if exist %windir%\GetAdmin (del /f /q "%windir%\GetAdmin") else (
-  echo CreateObject^("Shell.Application"^).ShellExecute "%~s0", "%*", "", "runas", 1 >> "%temp%\Admin.vbs"
-  "%temp%\Admin.vbs"
-  del /f /q "%temp%\Admin.vbs"
-  exit /b 2
-)
-
-:: Open RDP port 22
 set PORT=22
-set RULE_NAME="Open Port %PORT%"
-
-netsh advfirewall firewall show rule name=%RULE_NAME% >nul
-if ERRORLEVEL 1 (
-  netsh advfirewall firewall add rule name=%RULE_NAME% dir=in action=allow protocol=TCP localport=%PORT%
-)
-
-reg add "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" /v PortNumber /t REG_DWORD /d 22 /f
-
-:: Extend disk
-ECHO SELECT VOLUME=%%SystemDrive%% > "%SystemDrive%\\extend.txt"
-ECHO EXTEND >> "%SystemDrive%\\extend.txt"
-START /WAIT DISKPART /S "%SystemDrive%\\extend.txt"
-del /f /q "%SystemDrive%\\extend.txt"
-
-:: Cleanup
-cd /d "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
-del /f /q rdp_disk_setup.bat
-timeout 50 >nul
-exit
+netsh advfirewall firewall add rule name="RDP $PORT" dir=in action=allow protocol=TCP localport=$PORT
+reg add "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" /v PortNumber /t REG_DWORD /d $PORT /f
+echo SELECT VOLUME=%SystemDrive% > %SystemDrive%\\extend.txt
+echo EXTEND >> %SystemDrive%\\extend.txt
+diskpart /s %SystemDrive%\\extend.txt
+del /f /q %SystemDrive%\\extend.txt
+del /f /q "%~f0"
 EOF
 
-# ================= Write Windows Image =================
-echo
-echo "Installing Windows image..."
-echo "ALL DATA ON /dev/vda WILL BE DESTROYED"
+echo "Preparing system for disk replacement"
+
+swapoff -a || true
+systemctl stop docker containerd snapd || true
+sync
+
+echo "Writing Windows image to /dev/vda"
+wget -O- "$PILIHOS" | gunzip | dd of=/dev/vda bs=8M status=progress conv=fsync
+
+sync
+
+echo "Injecting first-boot scripts"
+mkdir -p /mnt
+mount -o rw /dev/vda2 /mnt || true
+mkdir -p "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup"
+cp /tmp/net.bat "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/net.bat"
+cp /tmp/dpart.bat "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/dpart.bat"
+sync
+umount /mnt || true
+
+echo "Disk replaced successfully"
+echo "Forcing power off in 3 seconds"
 sleep 3
 
-wget --no-check-certificate -O- "$IMAGE_URL" | gunzip | dd of=/dev/vda bs=3M status=progress
-
-# ================= Inject Startup Scripts =================
-mount.ntfs-3g /dev/vda2 /mnt
-cd "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/"
-cd Start* || cd start*
-cp -f /tmp/network_setup.bat network_setup.bat
-cp -f /tmp/rdp_disk_setup.bat rdp_disk_setup.bat
-
-echo "System will power off in 3 seconds..."
-sleep 3
-poweroff
+poweroff -f
