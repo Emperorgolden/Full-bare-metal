@@ -1,74 +1,103 @@
 #!/bin/bash
-set -e
 
-echo "Select Windows image to deploy"
+echo "Select OS to install"
 echo "  1) Windows 2019 (Default)"
 echo "  2) Windows 10 Super Lite SF"
 echo "  3) Windows 10 Super Lite MF"
 echo "  4) Windows 10 Super Lite CF"
-echo "  5) Use your own .gz image link"
+echo "  5) Use your own GZ link"
 
 read -p "Choose [1]: " PILIHOS
 
 case "$PILIHOS" in
-    1|"") PILIHOS="https://sourceforge.net/projects/nixpoin/files/windows2019DO.gz";;
-    2) PILIHOS="https://master.dl.sourceforge.net/project/manyod/wedus10lite.gz?viasf=1";;
-    3) PILIHOS="https://download1582.mediafire.com/lemxvneeredgyBT5P6YtAU5Dq-mikaH29djd8VnlyMcV1iM_vHJzYCiTc8V3PQkUslqgQSG0ftRJ0X2w3t1D7T4a-616-phGqQ2xKCn8894r0fdV9jKMhVYKH8N1dXMvtsZdK6e4t9F4Hg66wCzpXvuD_jcRu9_-i65_Kbr-HeW8Bw/gcxlheshfpbyigg/wedus10lite.gz";;
-    4) PILIHOS="https://umbel.my.id/wedus10lite.gz";;
-    5) read -p "Enter your .gz image URL: " PILIHOS;;
-    *) echo "Invalid selection"; exit 1;;
+        1|"") PILIHOS="https://sourceforge.net/projects/nixpoin/files/windows2019DO.gz";;
+        2) PILIHOS="https://master.dl.sourceforge.net/project/manyod/wedus10lite.gz?viasf=1";;
+        3) PILIHOS="https://download1582.mediafire.com/lemxvneeredgyBT5P6YtAU5Dq-mikaH29djd8VnlyMcV1iM_vHJzYCiTc8V3PQkUslqgQSG0ftRJ0X2w3t1D7T4a-616-phGqQ2xKCn8894r0fdV9jKMhVYKH8N1dXMvtsZdK6e4t9F4Hg66wCzpXvuD_jcRu9_-i65_Kbr-HeW8Bw/gcxlheshfpbyigg/wedus10lite.gz";;
+        4) PILIHOS="https://umbel.my.id/wedus10lite.gz";;
+        5) read -p "Enter your GZ link: " PILIHOS;;
+        *) echo "invalid option"; exit;;
 esac
 
-echo "Enter Administrator password for Windows (minimum 12 characters)"
-read -s PASSADMIN
-echo
+echo "Use a strong password (minimum 12 characters)"
+read -p "Enter Administrator password: " PASSADMIN
 
 IP4=$(curl -4 -s icanhazip.com)
 GW=$(ip route | awk '/default/ { print $3 }')
 
+DISK=$(lsblk -ndo NAME,SIZE,TYPE | awk '$3=="disk"{print $1,$2}' | sort -k2 -h | tail -n1 | awk '{print $1}')
+DISK="/dev/$DISK"
+
 cat >/tmp/net.bat<<EOF
 @ECHO OFF
+cd.>%windir%\GetAdmin
+if exist %windir%\GetAdmin (del /f /q "%windir%\GetAdmin") else (
+echo CreateObject^("Shell.Application"^).ShellExecute "%~s0", "%*", "", "runas", 1 >> "%temp%\Admin.vbs"
+"%temp%\Admin.vbs"
+del /f /q "%temp%\Admin.vbs"
+exit /b 2)
 net user Administrator $PASSADMIN
-netsh interface ip set address name="Ethernet Instance 0" static $IP4 255.255.240.0 $GW
-netsh interface ip add dnsservers name="Ethernet Instance 0" 8.8.8.8 index=1
-netsh interface ip add dnsservers name="Ethernet Instance 0" 8.8.4.4 index=2
-del /f /q "%~f0"
+
+for /f "tokens=3*" %%i in ('netsh interface show interface ^|findstr /I /R "Ethernet"') do (set InterfaceName=%%j)
+netsh -c interface ip set address name="Ethernet" source=static address=$IP4 mask=255.255.240.0 gateway=$GW
+netsh -c interface ip add dnsservers name="Ethernet" address=8.8.8.8 index=1 validate=no
+netsh -c interface ip add dnsservers name="Ethernet" address=8.8.4.4 index=2 validate=no
+
+cd /d "%ProgramData%/Microsoft/Windows/Start Menu/Programs/Startup"
+del /f /q net.bat
+exit
 EOF
 
 cat >/tmp/dpart.bat<<EOF
 @ECHO OFF
-set PORT=22
-netsh advfirewall firewall add rule name="RDP $PORT" dir=in action=allow protocol=TCP localport=$PORT
-reg add "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" /v PortNumber /t REG_DWORD /d $PORT /f
-echo SELECT VOLUME=%SystemDrive% > %SystemDrive%\\extend.txt
-echo EXTEND >> %SystemDrive%\\extend.txt
-diskpart /s %SystemDrive%\\extend.txt
-del /f /q %SystemDrive%\\extend.txt
-del /f /q "%~f0"
+echo DO NOT CLOSE THIS WINDOW
+echo THIS SCRIPT WILL CHANGE RDP PORT TO 9999, AFTER RESTART CONNECT USING $IP4:9999
+echo TYPE YES AND PRESS ENTER!
+
+cd.>%windir%\GetAdmin
+if exist %windir%\GetAdmin (del /f /q "%windir%\GetAdmin") else (
+echo CreateObject^("Shell.Application"^).ShellExecute "%~s0", "%*", "", "runas", 1 >> "%temp%\Admin.vbs"
+"%temp%\Admin.vbs"
+del /f /q "%temp%\Admin.vbs"
+exit /b 2)
+
+set PORT=9999
+set RULE_NAME="Open Port %PORT%"
+
+netsh advfirewall firewall show rule name=%RULE_NAME% >nul
+if not ERRORLEVEL 1 (
+    echo Rule already exists
+) else (
+    netsh advfirewall firewall add rule name=%RULE_NAME% dir=in action=allow protocol=TCP localport=%PORT%
+)
+
+reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v PortNumber /t REG_DWORD /d 9999 /f
+
+ECHO SELECT VOLUME=%%SystemDrive%% > "%SystemDrive%\diskpart.extend"
+ECHO EXTEND >> "%SystemDrive%\diskpart.extend"
+START /WAIT DISKPART /S "%SystemDrive%\diskpart.extend"
+
+del /f /q "%SystemDrive%\diskpart.extend"
+cd /d "%ProgramData%/Microsoft/Windows/Start Menu/Programs/Startup"
+del /f /q dpart.bat
+timeout 50 >nul
+exit
 EOF
 
-echo "Preparing system for disk replacement"
-
-swapoff -a || true
-systemctl stop docker containerd snapd || true
-sync
-
-echo "Writing Windows image to /dev/vda"
-wget -O- "$PILIHOS" | gunzip | dd of=/dev/vda bs=8M status=progress conv=fsync
+wget --no-check-certificate -O- "$PILIHOS" | gunzip | dd of=$DISK bs=4M status=progress
 
 sync
+sleep 5
 
-echo "Injecting first-boot scripts"
-mkdir -p /mnt
-mount -o rw /dev/vda2 /mnt || true
-mkdir -p "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup"
-cp /tmp/net.bat "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/net.bat"
-cp /tmp/dpart.bat "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/dpart.bat"
+PART=$(lsblk -ln $DISK | awk 'NR==2{print $1}')
+
+mount.ntfs-3g /dev/$PART /mnt || exit 1
+
+cd "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/" || exit
+cd Start* || cd start*
+
+cp -f /tmp/net.bat net.bat
+cp -f /tmp/dpart.bat dpart.bat
+
 sync
-umount /mnt || true
-
-echo "Disk replaced successfully"
-echo "Forcing power off in 3 seconds"
 sleep 3
-
-poweroff -f
+poweroff
